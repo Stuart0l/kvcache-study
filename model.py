@@ -5,12 +5,10 @@ same thing, with or without a cache.
 """
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
-
-LayerCache = Optional[Tuple[torch.Tensor, torch.Tensor]]  # (K, V) per layer
 
 
 @dataclass
@@ -22,15 +20,43 @@ class ModelConfig:
     max_seq_len: int = 2048
 
 
+class KVCache:
+    """Mutable per-layer key/value cache.
+
+    Create one, pass the *same* object into every forward call for a
+    generation run -- it grows in place as each layer appends its newest
+    K/V, so callers never thread a return value back in like a functional
+    accumulator. Passing `cache=None` anywhere (attention, block, model)
+    means "no cache, attend over the given tokens only," which is also how
+    plain no-cache generation reuses the same code path.
+    """
+
+    def __init__(self, n_layers: int):
+        self._k: List[Optional[torch.Tensor]] = [None] * n_layers
+        self._v: List[Optional[torch.Tensor]] = [None] * n_layers
+
+    def update(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor):
+        """Append this layer's new K/V and return the full (cached + new)
+        K/V to attend over."""
+        if self._k[layer_idx] is None:
+            self._k[layer_idx] = k_new
+            self._v[layer_idx] = v_new
+        else:
+            self._k[layer_idx] = torch.cat([self._k[layer_idx], k_new], dim=2)
+            self._v[layer_idx] = torch.cat([self._v[layer_idx], v_new], dim=2)
+        return self._k[layer_idx], self._v[layer_idx]
+
+
 class CausalSelfAttention(nn.Module):
     """Hand-written multi-head causal self-attention.
 
-    forward(x, cache) handles both generation modes with one code path:
+    forward(x, cache, layer_idx) handles both generation modes with one
+    code path:
     - no cache: x is the full sequence so far, cache is None -> standard
       causal attention over the whole sequence.
-    - with cache: x is only the newest token(s), cache holds the K/V for
-      everything before it -> new K/V are computed for x, appended to the
-      cache, and the new queries attend over cached+new keys/values.
+    - with cache: x is only the newest token(s); new K/V are computed for
+      x, handed to `cache.update(...)` which appends them and returns the
+      full cached+new K/V, and the new queries attend over that.
     A single mask construction covers both cases: keys coming from the
     cache are always in the past (no masking needed), keys coming from the
     new chunk get a standard causal sub-mask.
@@ -50,19 +76,16 @@ class CausalSelfAttention(nn.Module):
         B, T, _ = t.shape
         return t.view(B, T, self.n_heads, self.d_head).transpose(1, 2)  # (B, H, T, Dh)
 
-    def forward(self, x: torch.Tensor, cache: LayerCache = None):
+    def forward(self, x: torch.Tensor, cache: Optional[KVCache] = None, layer_idx: int = 0):
         B, T_new, _ = x.shape
         q = self._split_heads(self.w_q(x))
         k_new = self._split_heads(self.w_k(x))
         v_new = self._split_heads(self.w_v(x))
 
         if cache is not None:
-            k_prev, v_prev = cache
-            k_full = torch.cat([k_prev, k_new], dim=2)
-            v_full = torch.cat([v_prev, v_new], dim=2)
+            k_full, v_full = cache.update(layer_idx, k_new, v_new)
         else:
             k_full, v_full = k_new, v_new
-        new_cache = (k_full, v_full)
 
         T_k = k_full.shape[2]
         T_cache = T_k - T_new
@@ -81,7 +104,7 @@ class CausalSelfAttention(nn.Module):
         attn = torch.softmax(scores, dim=-1)
         out = attn @ v_full  # (B, H, T_new, Dh)
         out = out.transpose(1, 2).contiguous().view(B, T_new, self.n_heads * self.d_head)
-        return self.w_o(out), new_cache
+        return self.w_o(out)
 
 
 class Block(nn.Module):
@@ -94,11 +117,10 @@ class Block(nn.Module):
             nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model)
         )
 
-    def forward(self, x: torch.Tensor, cache: LayerCache = None):
-        attn_out, new_cache = self.attn(self.ln1(x), cache)
-        x = x + attn_out
+    def forward(self, x: torch.Tensor, cache: Optional[KVCache] = None, layer_idx: int = 0):
+        x = x + self.attn(self.ln1(x), cache, layer_idx)
         x = x + self.mlp(self.ln2(x))
-        return x, new_cache
+        return x
 
 
 class TinyGPT(nn.Module):
@@ -113,29 +135,21 @@ class TinyGPT(nn.Module):
         self.ln_f = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
-    def forward(
-        self,
-        idx: torch.Tensor,
-        cache: Optional[List[LayerCache]] = None,
-        pos_offset: int = 0,
-    ):
+    def forward(self, idx: torch.Tensor, cache: Optional[KVCache] = None, pos_offset: int = 0):
         """idx: (B, T_new) ids of only the NEW tokens for this call.
-        cache: list of per-layer (K, V), or None on the first call.
+        cache: a KVCache to read/append to in place, or None to attend
+        over just idx (full-sequence, no-cache mode).
         pos_offset: absolute sequence position of idx[:, 0].
         """
         B, T_new = idx.shape
         positions = torch.arange(pos_offset, pos_offset + T_new, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(positions)[None, :, :]
 
-        if cache is None:
-            cache = [None] * len(self.blocks)
-        new_cache = []
-        for block, layer_cache in zip(self.blocks, cache):
-            x, layer_new_cache = block(x, layer_cache)
-            new_cache.append(layer_new_cache)
+        for layer_idx, block in enumerate(self.blocks):
+            x = block(x, cache, layer_idx)
 
         x = self.ln_f(x)
-        return self.head(x), new_cache
+        return self.head(x)
 
 
 @torch.no_grad()
@@ -158,7 +172,7 @@ def generate_no_cache(
             if device == "mps":
                 torch.mps.synchronize()
             t0 = _now()
-        logits, _ = model(idx, cache=None, pos_offset=0)
+        logits = model(idx, cache=None, pos_offset=0)
         if record_times:
             if device == "mps":
                 torch.mps.synchronize()
@@ -184,13 +198,14 @@ def generate_with_cache(
     model.eval()
     idx = prompt_ids.clone().to(device)
     T0 = idx.shape[1]
+    cache = KVCache(model.cfg.n_layers)
     step_times = [] if record_times else None
 
     if record_times:
         if device == "mps":
             torch.mps.synchronize()
         t0 = _now()
-    logits, cache = model(idx, cache=None, pos_offset=0)
+    logits = model(idx, cache=cache, pos_offset=0)
     if record_times:
         if device == "mps":
             torch.mps.synchronize()
@@ -205,7 +220,7 @@ def generate_with_cache(
             if device == "mps":
                 torch.mps.synchronize()
             t0 = _now()
-        logits, cache = model(next_id, cache=cache, pos_offset=pos)
+        logits = model(next_id, cache=cache, pos_offset=pos)
         if record_times:
             if device == "mps":
                 torch.mps.synchronize()
